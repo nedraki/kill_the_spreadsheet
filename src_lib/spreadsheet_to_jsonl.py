@@ -3,20 +3,25 @@ from typing import Union, IO
 import re
 
 def excel_to_jsonl(input_data: Union[str, pd.DataFrame, IO]) -> Union[str, None]:
-    
-    """    
-    Converts an Excel file or DataFrame to a JSONL file, preserving data types.
+    """
+    Converts an Excel file or DataFrame to a JSONL (JSON Lines) string.
+
+    This function reads data, cleans column names to be BigQuery-compatible
+    (lowercase, underscores for spaces, alphanumeric characters only), and then
+    serializes the DataFrame into a JSONL string.
 
     Args:
-        input_data (Union[str, pd.DataFrame, IO]): The path to the Excel file, a pandas DataFrame,
-                                                   or a file-like object (e.g., from Streamlit's file_uploader).
+        input_data: The input data, which can be a file path (str), a pandas
+                    DataFrame, or a file-like object (e.g., from Streamlit's
+                    file_uploader).
+
     Returns:
-        Union[str, None]: The JSONL data as a string, or None if an error occurred.
+        The JSONL data as a string, or None if an error occurs.
     """
     try:
         # Check if input_data is a string (file path) or a file-like object.
         # pd.read_excel can handle both types.
-        if isinstance(input_data, str) or hasattr(input_data, 'read'):
+        if isinstance(input_data, str) or hasattr(input_data, "read"):
             df = pd.read_excel(input_data)
             if isinstance(input_data, str):
                 print(f"Reading Excel file from path: '{input_data}'")
@@ -28,19 +33,23 @@ def excel_to_jsonl(input_data: Union[str, pd.DataFrame, IO]) -> Union[str, None]
             print("Using provided DataFrame")
         else:
             # This case should ideally not be reached if type hints are respected
-            raise TypeError("input_data must be a file path, a file-like object, or a pandas DataFrame")
+            raise TypeError(
+                "input_data must be a file path, a file-like object, or a pandas DataFrame"
+            )
 
         # Clean column names for BigQuery compatibility
         cleaned_columns = []
         for col in df.columns:
             new_col = col.lower()  # Convert to lowercase
-            new_col = new_col.replace(' ', '_')  # Replace spaces with underscores
-            new_col = re.sub(r'[^a-zA-Z0-9_]', '', new_col)  # Remove all other invalid characters
+            new_col = new_col.replace(" ", "_")  # Replace spaces with underscores
+            new_col = re.sub(
+                r"[^a-zA-Z0-9_]", "", new_col
+            )  # Remove all other invalid characters
             cleaned_columns.append(new_col)
         df.columns = cleaned_columns
 
         # Convert the DataFrame to JSONL format.
-        jsonl_data = df.to_json(orient='records', lines=True, date_format='iso')
+        jsonl_data = df.to_json(orient="records", lines=True, date_format="iso")
 
         print(f"Successfully converted data to JSONL format.")
         return jsonl_data
