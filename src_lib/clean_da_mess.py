@@ -1,319 +1,256 @@
-import pandas as pd
-import numpy as np
-import janitor
+"""Deterministic, conservative cleaning with lossless row quarantine.
+
+The four-item public result is retained. DataFrame attrs contain positional column
+mapping and quarantine metadata names; index labels are never used as row IDs.
+"""
+from datetime import date, datetime, timezone
+from decimal import Decimal, InvalidOperation
+import math
+import numbers
 import re
-from typing import Tuple, Dict, Any
-import dateparser  # <-- Added dateparser import
+import unicodedata
 
-# --- Constants for Type Inference ---
+import pandas as pd
 
-# Values to be universally treated as "missing" or "not applicable"
-# We do this BEFORE type inference.
-JUNK_VALUES = {
-    "na",
-    "n/a",
-    "#na",
-    "null",
-    "none",
-    "pending",
-    "unknown",
-    "undefined",
-    "--",
-    "...",
-    "",
-}
+CURRENCY_MAP = {'C$': '_cad_', 'A$': '_aud_', '€': '_eur_', '$': '_usd_',
+                '£': '_gbp_', '¥': '_jpy_', '₹': '_inr_', '₩': '_krw_', '₽': '_rub_'}
+TRUE_VALUES = {'true', '1', 'yes', 'y', 't', 'active', 'on'}
+FALSE_VALUES = {'false', '0', 'no', 'n', 'f', 'inactive', 'off'}
+TYPES = {'STRING', 'BOOLEAN', 'INTEGER', 'NUMERIC', 'DATE', 'DATETIME', 'TIMESTAMP'}
+INT_MIN, INT_MAX = -(2**63), 2**63 - 1
+NUMERIC_MAX = Decimal('99999999999999999999999999999.999999999')
+RESERVED = ('_table_', '_file_', '_partition', '_row_timestamp', '__root__',
+            '_colidentifier', '_change_sequence_number', '_change_type',
+            '_change_timestamp', '_field_')
 
-# Values to be interpreted as BOOLEAN True
-TRUE_VALUES = {"true", "1", "yes", "y", "t", "active", "on"}
-
-# Values to be interpreted as BOOLEAN False
-FALSE_VALUES = {"false", "0", "no", "n", "f", "inactive", "off"}
-
-# --- NEW: Define currency symbols to replace ---
-# NOTE: Multi-character symbols like 'C$' must come BEFORE
-
-# Single-character symbols like '$' to be replaced correctly.
-CURRENCY_MAP = {
-    'C$': '_cad_',
-    'A$': '_aud_',
-    '€': '_eur_',
-    '$': '_usd_',
-    '£': 'gbp',
-    '¥': 'jpy',
-    '₹': 'inr',
-    '₩': 'krw',
-    '₽': 'rub',
-    # --- Add any other symbols you need here ---
-}
 
 def clean_bigquery_column(col_name):
-    """
-    Cleans a string to make it a valid BigQuery column name,
-    replacing common currency symbols with their 3-letter codes.
-    """
-    
-    cleaned = str(col_name)
-
-    # 1. NEW: Replace currency symbols first
+    name = str(col_name)
     for symbol, code in CURRENCY_MAP.items():
-        cleaned = cleaned.replace(symbol, code)
-    
-    # 2. Replace remaining invalid characters with an underscore
-    cleaned = re.sub(r"[^a-zA-Z0-9_]+", "_", cleaned)
-    
-    # 3. Remove leading/trailing underscores
-    cleaned = cleaned.strip("_")
-    
-    # 4. Convert to lowercase
-    cleaned = cleaned.lower()
-    
-    # 5. Handle rule: Must start with a letter or underscore
-    if re.match(r"^[0-9]", cleaned):
-        cleaned = "_" + cleaned
-        
-    # 6. Handle empty strings
-    if not cleaned:
-        cleaned = "unnamed_col"
-        
-    # 7. Handle max length (300 chars)
-    return cleaned[:300]
+        name = name.replace(symbol, code)
+    name = unicodedata.normalize('NFKD', name).encode('ascii', 'ignore').decode()
+    name = re.sub(r'[^a-zA-Z0-9_]+', '_', name).strip('_').lower() or 'unnamed_col'
+    if name[0].isdigit():
+        name = '_' + name
+    if name.startswith(RESERVED):
+        name = 'col' + name
+    return name[:300]
 
 
-def clean_generic_dataframe(
-    df_raw: pd.DataFrame, TYPE_INFERENCE_THRESHOLD=0.90
-) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, Dict[str, str]]:
-    """
-    Cleans a generic, messy DataFrame by inferring types, coercing data,
-    and quarantining rows that fail to parse.
+def unique_column_names(columns):
+    """Allocate names by position; even repeated source labels remain distinct."""
+    used, result = set(), []
+    for column in columns:
+        base = clean_bigquery_column(column)
+        name, suffix = base, 2
+        while name in used:
+            tail = f'_{suffix}'
+            name = base[:300 - len(tail)] + tail
+            suffix += 1
+        used.add(name)
+        result.append(name)
+    return result
 
-    Args:
-        df_raw (pd.DataFrame): The raw, messy pandas DataFrame (e.g., from pd.read_excel).
-        TYPE_INFERENCE_THRESHOLD (float): The ratio of values in a column that must
-            successfully parse to a given type for the entire column to be
-            coerced to that type.
-            # Heuristic: If > this % of non-null data parses, we'll assign the type
-Defaults to 0.90.
 
-    Returns:
-        Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, Dict[str, str]]:
-            A tuple containing four items:
-            1. df_comparison: A DataFrame showing the original data side-by-side
-               with the new '_clean' columns for comparison.
-            2. df_load_ready: A DataFrame containing *only* the cleaned and
-               coerced data, ready for loading into a database. Column names
-               are sanitized.
-            3. df_quarantine: A DataFrame containing the *original* rows that
-               had at least one value that failed parsing, plus a detailed
-               'quarantine_reason' column.
-            4. type_report: A dictionary mapping original column names to
-               their inferred data type (e.g., {'user_id': 'INTEGER'}).
+def is_missing(value):
+    if value is None or value is pd.NA or value is pd.NaT:
+        return True
+    return isinstance(value, numbers.Real) and not isinstance(value, numbers.Integral) and math.isnan(value)
+
+
+def _text(value):
+    if isinstance(value, (datetime, date)):
+        return value.isoformat()
+    return str(value)
+
+
+def _decimal(value, number_format):
+    if isinstance(value, bool):
+        raise ValueError('Boolean is not a number')
+    text = str(value).strip()
+    if number_format != 'plain':
+        # Explicit locale opt-in; separators must form valid groups.
+        text = re.sub(r'^(?:C\$|A\$|[$€£])\s*', '', text)
+        if text.startswith('(') and text.endswith(')'):
+            text = '-' + text[1:-1]
+        grouping, point = (',', '.') if number_format == 'us' else ('.', ',')
+        pattern = rf'[+-]?(?:[0-9]+|[0-9]{{1,3}}(?:{re.escape(grouping)}[0-9]{{3}})+)(?:{re.escape(point)}[0-9]+)?'
+        if not re.fullmatch(pattern, text):
+            raise ValueError('Invalid numeric grouping')
+        text = text.replace(grouping, '').replace(point, '.')
+    if len(text) > 128 or not re.fullmatch(r'[+-]?(?:[0-9]+(?:\.[0-9]+)?|\.[0-9]+)(?:[eE][+-]?[0-9]+)?', text):
+        raise ValueError('Not a canonical number')
+    result = Decimal(text)
+    if not result.is_finite():
+        raise ValueError('Non-finite number')
+    return result
+
+
+def _numeric_fits(value):
+    # Decimal comparisons/tuple inspection avoid context-dependent rounding.
+    _, digits, exponent = value.as_tuple()
+    trailing = 0
+    for digit in reversed(digits):
+        if digit != 0:
+            break
+        trailing += 1
+    return value.copy_abs() <= NUMERIC_MAX and (not value or exponent + trailing >= -9)
+
+
+def _datetime(value, date_format):
+    if isinstance(value, datetime):
+        return value
+    if isinstance(value, date):
+        return datetime.combine(value, datetime.min.time())
+    text = str(value).strip()
+    if date_format:
+        # Require complete date components; disallow implicit current/default year.
+        if not all(code in date_format for code in ('%Y', '%m', '%d')):
+            raise ValueError('date_format must include %Y, %m and %d')
+        return datetime.strptime(text, date_format)
+    if not re.fullmatch(r'[0-9]{4}-[0-9]{2}-[0-9]{2}(?:[T ][0-9]{2}:[0-9]{2}:[0-9]{2}(?:\.[0-9]{1,6})?(?:Z|[+-][0-9]{2}:[0-9]{2})?)?', text):
+        raise ValueError('Not a complete ISO date or datetime')
+    return datetime.fromisoformat(text.replace('Z', '+00:00'))
+
+
+def _convert(value, kind, number_format, date_format):
+    if is_missing(value):
+        return None
+    if isinstance(value, numbers.Real) and not isinstance(value, numbers.Integral) and not math.isfinite(value):
+        raise ValueError('Non-finite source number')
+    if isinstance(value, Decimal) and not value.is_finite():
+        raise ValueError('Non-finite source number')
+    if isinstance(value, (dict, list, tuple, set)):
+        raise ValueError('Nested values are unsupported')
+    if kind == 'STRING':
+        return _text(value)
+    if kind == 'BOOLEAN':
+        text = str(value).strip().lower()
+        if text not in TRUE_VALUES | FALSE_VALUES:
+            raise ValueError('Not a boolean')
+        return text in TRUE_VALUES
+    if kind in {'INTEGER', 'NUMERIC'}:
+        number = _decimal(value, number_format)
+        if kind == 'INTEGER':
+            if number != number.to_integral_value() or not INT_MIN <= number <= INT_MAX:
+                raise ValueError('Outside exact INT64 range')
+            return int(number)
+        if not _numeric_fits(number):
+            raise ValueError('Outside exact BigQuery NUMERIC precision/range')
+        return number
+    parsed = _datetime(value, date_format)
+    aware = parsed.utcoffset() is not None
+    if kind == 'TIMESTAMP':
+        if not aware:
+            raise ValueError('TIMESTAMP requires an explicit timezone')
+        return parsed.astimezone(timezone.utc)
+    if aware:
+        raise ValueError('Timezone cannot be discarded')
+    if kind == 'DATE':
+        if parsed.time() != datetime.min.time():
+            raise ValueError('Time cannot be discarded')
+        return parsed.date()
+    return parsed
+
+
+def _attempt(value, kind, number_format, date_format):
+    try:
+        return _convert(value, kind, number_format, date_format), None
+    except (ValueError, TypeError, OverflowError, InvalidOperation) as exc:
+        return None, str(exc)
+
+
+def _infer(values, threshold, number_format, date_format):
+    present = [v for v in values if not is_missing(v)]
+    if not present:
+        return 'STRING'
+    if all(isinstance(v, bool) or str(v).strip().lower() in {'true', 'false'} for v in present):
+        return 'BOOLEAN'
+    strings = [v.strip() for v in present if isinstance(v, str)]
+    # Preserve IDs and ambiguous numeric notation even below the inference threshold.
+    protected = any(re.fullmatch(r'[+-]?0[0-9]+', s) for s in strings)
+    protected |= bool(strings) and len(strings) == len(present) and set(strings) <= {'0', '1'}
+    if number_format == 'plain':
+        protected |= any(re.search(r'[0-9][,\s][0-9]|[$€£]', s) for s in strings)
+    if not protected:
+        numeric = []
+        for value in present:
+            try:
+                numeric.append(_decimal(value, number_format))
+            except (ValueError, InvalidOperation):
+                pass
+        if len(numeric) / len(present) >= threshold:
+            if all(v == v.to_integral_value() for v in numeric):
+                return 'INTEGER' if all(INT_MIN <= v <= INT_MAX for v in numeric) else 'STRING'
+            return 'NUMERIC' if all(_numeric_fits(v) for v in numeric) else 'STRING'
+    parsed = [_attempt(v, 'TIMESTAMP', number_format, date_format) for v in present]
+    naive = [_attempt(v, 'DATETIME', number_format, date_format) for v in present]
+    # Mixed timezone semantics cannot be safely inferred.
+    if any(e is None for _, e in parsed) and any(e is None for _, e in naive):
+        return 'STRING'
+    for kind in ('DATE', 'DATETIME', 'TIMESTAMP'):
+        results = [_attempt(v, kind, number_format, date_format) for v in present]
+        # Do not infer DATE by discarding time-bearing minority rows.
+        if kind == 'DATE' and any(e and 'Time cannot' in e for _, e in results):
+            continue
+        if sum(error is None for _, error in results) / len(present) >= threshold:
+            return kind
+    return 'STRING'
+
+
+def clean_generic_dataframe(df_raw, TYPE_INFERENCE_THRESHOLD=0.90, *,
+                            column_types=None, null_values=(), number_format='plain',
+                            date_format=None):
+    """Clean without mutating input; only explicitly configured literals become null.
+
+    column_types keys use sanitized, unique output names. Locale parsing and date
+    formats are explicit opt-ins. All-null columns/rows are retained. The accepted
+    and quarantine outputs partition physical input rows, even with duplicate indices.
     """
     if not isinstance(df_raw, pd.DataFrame):
-        raise ValueError("Input must be a pandas DataFrame")
-
-    # --- 0. Pre-processing ---
-
-    # 1. Use pyjanitor to clean column names (e.g., "Total Spend ($)" -> "total_spend_dollar")
-    try:
-        df = df_raw.copy().clean_names()
-        df.columns= [clean_bigquery_column(col) for col in df.columns]
-    except:
-        # Handle potential edge cases in clean_names, though rare
-        df.columns= [clean_bigquery_column(col) for col in df.columns]
-
-    # 2. Drop columns and rows that are *entirely* empty
-    df = df.dropna(how="all", axis=1)  # Drop empty cols
-    df = df.dropna(how="all", axis=0)  # Drop empty rows
-
-    # Store original indices to reference the raw file
-    original_indices = df.index
-    df = df.reset_index(drop=True)  # Use a clean 0-based index for looping
-
-    # Helper function for dateparser
-    def _parse_date_robust(date_str):
-        """
-        Robustly parses a date string using the `dateparser` library.
-
-        Handles NaNs, converts input to string, and returns pd.NaT on any error.
-
-        Args:
-            date_str (Any): The value to parse as a date.
-
-        Returns:
-            datetime or pd.NaT: The parsed datetime object or NaT if parsing fails.
-        """
-        if pd.isna(date_str):
-            return pd.NaT
-        try:
-            # dateparser is very flexible but can be slow
-            return dateparser.parse(str(date_str))
-        except (TypeError, OverflowError, ValueError):  # Catch more errors
-            # Handle potential errors from dateparser
-            return pd.NaT
-
-    bad_rows_log = []
-    clean_column_map = {}
-    type_report = {}
-
-    # --- 1. The "Gauntlet": Iterate over each column ---
-    for col_name in df.columns:
-        if col_name.endswith("_clean"):  # Skip columns we may have already added
-            continue
-
-        series = df[col_name]
-
-        # 2. Standardize Junk Values
-        # Convert all to string, strip, lower, and replace JUNK_VALUES with np.nan
-        series_str_lower = series.astype(str).str.strip().str.lower()
-        series_std = series.where(~series_str_lower.isin(JUNK_VALUES))
-
-        original_non_null_count = series_std.notna().sum()
-
-        # If column is now empty, skip it
-        if original_non_null_count == 0:
-            type_report[col_name] = "EMPTY"
-            clean_column_map[f"{col_name}_clean"] = series_std
-            continue
-
-        inferred_type = "STRING"  # Default
-        clean_series = series_std  # Default
-
-        # --- 3. Heuristics: Try to infer type ---
-
-        # --- Check 1: BOOLEAN ---
-        # If all unique non-null values are in our boolean sets
-        unique_vals = set(series_std.dropna().astype(str).str.strip().str.lower())
-        if unique_vals.issubset(TRUE_VALUES.union(FALSE_VALUES)):
-            inferred_type = "BOOLEAN"
-            bool_map = {v: True for v in TRUE_VALUES} | {v: False for v in FALSE_VALUES}
-            clean_series = series_std.astype(str).str.strip().str.lower().map(bool_map)
-
-        else:
-            # --- Check 2: NUMERIC (INTEGER / FLOAT) ---
-
-            # Pre-clean numeric strings: remove $, €, commas, spaces
-            # And handle accounting format: (100.50) -> -100.50
-            series_numeric_str = (
-                series_std.astype(str)
-                .str.replace(r"[$,€\s,]", "", regex=True)
-                .str.replace(r"^\((.*)\)$", r"-\1", regex=True)  # (100) -> -100
-            )
-
-            # Try to coerce to number
-            coerced_numeric = pd.to_numeric(series_numeric_str, errors="coerce")
-            success_ratio = coerced_numeric.notna().sum() / original_non_null_count
-
-            if success_ratio >= TYPE_INFERENCE_THRESHOLD:
-                # It's numeric. Is it INT or FLOAT?
-                # Check if all non-null coerced values are whole numbers
-                if (coerced_numeric.dropna() % 1 == 0).all():
-                    inferred_type = "INTEGER"
-                    clean_series = coerced_numeric
-                else:
-                    inferred_type = "FLOAT"
-                    clean_series = coerced_numeric
-
-            else:
-                # --- Check 3: DATETIME (using dateparser) ---
-                # This is slower, so we do it after numeric
-                
-                # Exclude obvious non-dates (like long numbers) to speed up parser
-                # This is a heuristic: Excel serial dates are 5 digits.
-                likely_dates = series_std[
-                    series_std.astype(str).str.len() < 30  # Exclude long text
-                ]
-
-                # Run heuristic check on likely dates
-                coerced_datetime = likely_dates.apply(_parse_date_robust)
-                success_ratio = (
-                    coerced_datetime.notna().sum() / original_non_null_count
-                )
-
-                if success_ratio >= TYPE_INFERENCE_THRESHOLD:
-                    inferred_type = "DATETIME"
-                    # We must re-run on the *whole* series_std to get the final clean_series
-                    clean_series = series_std.apply(_parse_date_robust)
-
-        # --- 4. Store Results & Log Bad Rows ---
-        type_report[col_name] = inferred_type
-        clean_column_map[f"{col_name}_clean"] = clean_series
-
-        # Find the "bad" rows:
-        # Where the standardized original was NOT null,
-        # but the new clean version IS null.
-        bad_mask = (series_std.notna()) & (clean_series.isna())
-
-        if bad_mask.any():
-            failed_indices = df[bad_mask].index
-            for idx in failed_indices:
-                bad_rows_log.append(
-                    {
-                        "original_index": original_indices[idx],  # Get index from pre-reset df
-                        "quarantined_column": col_name,
-                        "original_value": df.iloc[idx][col_name],
-                        "reason": f"Failed to parse as {inferred_type}",
-                    }
-                )
-
-    # --- 5. Assemble Final Outputs ---
-
-    # 1. Create df_comparison (for comparison)
-    df_comparison = df.copy()
-    # Add all the new clean columns
-    for col_name, col_series in clean_column_map.items():
-        df_comparison[col_name] = col_series
-    
-    # Restore original index
-    df_comparison.index = original_indices
-
-    # 2. Create df_load_ready (with only clean data, ready for BQ)
-    df_load_ready_data = {}
-    for col_name in type_report.keys():
-        clean_col_key = f"{col_name}_clean"
-        if clean_col_key in clean_column_map:
-            # Add the clean series under the original sanitized name
-            df_load_ready_data[col_name] = clean_column_map[clean_col_key]
-        elif col_name in df:
-            # Fallback: This column was in type_report (e.g., 'EMPTY' or 'STRING')
-            # but had no clean series generated. Use the standardized original.
-            df_load_ready_data[col_name] = df[col_name]
-
-    df_load_ready = pd.DataFrame(df_load_ready_data)
-    # Restore original index
-    df_load_ready.index = original_indices
-
-    # 3. Create df_quarantine
-    if not bad_rows_log:
-        # No bad rows found!
-        df_quarantine = pd.DataFrame(
-            columns=["original_index", "quarantine_reason"] + df_raw.columns.tolist()
-        )
-    else:
-        quarantine_report = pd.DataFrame(bad_rows_log)
-
-        # Get all unique bad row indices
-        bad_indices = sorted(list(set(quarantine_report["original_index"])))
-
-        # Get the original, unmodified rows from the raw file
-        df_quarantine = df_raw.loc[bad_indices].copy()
-
-        # Create a summary of all errors for each row
-        reason_summary = (
-            quarantine_report.groupby("original_index")
-            .apply(
-                lambda x: "; ".join(
-                    f"Column '{r['quarantined_column']}': "
-                    f"Value '{r['original_value']}' "
-                    f"({r['reason']})"
-                    for i, r in x.iterrows()
-                )
-            )
-            .rename("quarantine_reason")
-        )
-
-        # Add the quarantine_reason as a new column
-        df_quarantine = df_quarantine.merge(
-            reason_summary, left_index=True, right_index=True
-        )
-
-    return df_comparison, df_load_ready, df_quarantine, type_report
+        raise ValueError('Input must be a pandas DataFrame')
+    if not isinstance(TYPE_INFERENCE_THRESHOLD, numbers.Real) or not 0 < TYPE_INFERENCE_THRESHOLD <= 1:
+        raise ValueError('Threshold must be in (0, 1]')
+    if number_format not in {'plain', 'us', 'eu'}:
+        raise ValueError('number_format must be plain, us or eu')
+    if date_format and not all(code in date_format for code in ('%Y', '%m', '%d')):
+        raise ValueError('date_format must include %Y, %m and %d')
+    names = unique_column_names(df_raw.columns)
+    overrides = column_types or {}
+    if set(overrides) - set(names) or set(overrides.values()) - TYPES:
+        raise ValueError('Unknown column or unsupported type override')
+    nulls = {str(v).strip().casefold() for v in null_values}
+    report, columns, errors = {}, {}, [[] for _ in range(len(df_raw))]
+    for position, name in enumerate(names):
+        values = [None if isinstance(v, str) and v.strip().casefold() in nulls else v
+                  for v in df_raw.iloc[:, position].tolist()]
+        kind = overrides.get(name) or _infer(values, TYPE_INFERENCE_THRESHOLD, number_format, date_format)
+        report[name] = kind
+        converted = []
+        for row, value in enumerate(values):
+            output, error = _attempt(value, kind, number_format, date_format)
+            converted.append(output)
+            if error:
+                errors[row].append(f"Column '{name}': {error} (expected {kind})")
+        columns[name] = pd.Series(converted, dtype=object)
+    cleaned = pd.DataFrame(columns, index=range(len(df_raw)))
+    cleaned.index = df_raw.index.copy()
+    accepted = [pos for pos, reasons in enumerate(errors) if not reasons]
+    rejected = [pos for pos, reasons in enumerate(errors) if reasons]
+    ready = cleaned.iloc[accepted].copy()
+    comparison = df_raw.copy(deep=True)
+    comparison.columns = names
+    combined_names = unique_column_names(names + [f'{name}_clean' for name in names])
+    for pos, name in enumerate(names):
+        comparison[combined_names[len(names) + pos]] = cleaned[name].to_numpy()
+    quarantine = df_raw.iloc[rejected].copy(deep=True)
+    metadata = unique_column_names(list(df_raw.columns) + ['source_position', 'original_index', 'quarantine_reason'])[-3:]
+    quarantine[metadata[0]] = rejected
+    quarantine[metadata[1]] = [df_raw.index[pos] for pos in rejected]
+    quarantine[metadata[2]] = ['; '.join(errors[pos]) for pos in rejected]
+    quarantine.attrs['metadata_columns'] = dict(zip(('source_position', 'original_index', 'quarantine_reason'), metadata))
+    mapping = [{'position': pos, 'original': str(original), 'cleaned': name}
+               for pos, (original, name) in enumerate(zip(df_raw.columns, names))]
+    for frame in (comparison, ready, quarantine):
+        frame.attrs['column_mapping'] = mapping
+    return comparison, ready, quarantine, report

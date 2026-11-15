@@ -17,3 +17,7 @@ wheels/
 *.csv
 *.xls
 *.xlsx
+
+# Test caches
+.pytest_cache/
+.hypothesis/
