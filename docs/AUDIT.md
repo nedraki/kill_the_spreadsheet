@@ -51,7 +51,7 @@ All changes use `codex/` branches and PRs; no direct changes are pushed to main.
 
 - [PR #5](https://github.com/nedraki/kill_the_spreadsheet/pull/5): cleaning, tests and CI.
 - [PR #8](https://github.com/nedraki/kill_the_spreadsheet/pull/8): exact export and schema.
-- Final workbook/UI PR: strict ingestion, end-to-end/UI tests, mixed currencies,
+- [PR #10](https://github.com/nedraki/kill_the_spreadsheet/pull/10): strict ingestion, end-to-end/UI tests, mixed currencies,
   coverage gate, updated workflow documentation and version 0.2.0.
 
 ## Boundaries and remaining operational checks
