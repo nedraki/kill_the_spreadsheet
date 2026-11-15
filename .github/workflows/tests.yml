@@ -18,4 +18,4 @@ jobs:
           version: '0.9.11'
           python-version: ${{ matrix.python }}
       - run: uv sync --locked
-      - run: uv run pytest -q
+      - run: uv run pytest -q --cov=src_lib --cov=main --cov-report=term-missing --cov-fail-under=90
