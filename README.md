@@ -71,9 +71,7 @@ and rejection reasons. Resolve those rows in the source and run cleaning again.
 
 ## Supported input and limits
 
-Only `.xlsx` is supported. Save legacy `.xls` files as `.xlsx` first; the former
-UI advertised `.xls` without having a working reader. Select one table per sheet;
-totals, footers and other embedded tables need to be separated in the source.
+Only `.xlsx` is supported
 
 Formula/error cells and merged cells in the selected table block export with
 coordinates. Replace formulas with verified values and resolve errors yourself;
