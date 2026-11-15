@@ -1,7 +1,8 @@
 import streamlit as st
 import pandas as pd
-import os  # Added for filename manipulation
-from src_lib.spreadsheet_to_jsonl import excel_to_jsonl
+import os
+import json
+from src_lib.spreadsheet_to_jsonl import dataframe_to_jsonl, bigquery_schema
 from src_lib.clean_da_mess import clean_generic_dataframe
 
 
@@ -91,7 +92,7 @@ if excel_file is not None:
             
             # JSONL data session state
             # TO DO: Integrate regex into clean da mess to avoid special characters (using excel to json temporarily)
-            st.session_state.jsonl_data = df_load_ready.to_json(orient="records", lines=True, date_format="iso")
+            st.session_state.jsonl_data = dataframe_to_jsonl(df_load_ready, type_report)
 
             st.success("Showing the first 5 rows of cleaned data:")
             st.write(df_load_ready.head())
@@ -104,6 +105,13 @@ if excel_file is not None:
         # This now appears automatically because st.session_state.jsonl_data is set
         with st.container(border=True):
             st.subheader("🚀 Step 3: Download Your File")
+            st.info("Load the JSONL with the matching schema below; disable BigQuery schema autodetection.")
+            st.download_button(
+                label="Download BigQuery schema",
+                data=json.dumps(bigquery_schema(type_report), indent=2),
+                file_name=f"{st.session_state.file_name}.schema.json",
+                mime="application/json",
+            )
             st.download_button(
                 label=f"Download {st.session_state.file_name}.jsonl",
                 data=st.session_state.jsonl_data,

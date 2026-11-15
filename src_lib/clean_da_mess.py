@@ -99,6 +99,8 @@ def _numeric_fits(value):
 
 def _datetime(value, date_format):
     if isinstance(value, datetime):
+        if getattr(value, 'nanosecond', 0):
+            raise ValueError('Sub-microsecond precision is unsupported by BigQuery')
         return value
     if isinstance(value, date):
         return datetime.combine(value, datetime.min.time())

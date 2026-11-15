@@ -38,3 +38,18 @@ be reconstructed. Workbook/export/UI findings and release validation follow belo
 
 References: [BigQuery schemas](https://docs.cloud.google.com/bigquery/docs/schemas),
 [JSON loading](https://docs.cloud.google.com/bigquery/docs/loading-data-cloud-storage-json).
+
+## Export findings and fix
+
+[#6](https://github.com/nedraki/kill_the_spreadsheet/issues/6): all four initial export
+regressions failed (input mutation, decimal rounding, unnamed stream failure, hidden
+exceptions). A single strict serializer now feeds the UI and library; exact NUMERIC
+values and integers outside the JSON safe range are strings, accompanied by a matching
+BigQuery schema. Schema autodetection must be disabled. This completes the export part
+of #2. Recovery JSONL keeps rejected cells positionally, even for duplicate source
+headers. Unsupported values and sub-microsecond datetimes cannot silently truncate.
+The expanded suite passes 50 tests locally; CI checks both supported Python versions.
+
+[#7](https://github.com/nedraki/kill_the_spreadsheet/issues/7): default Excel ingestion
+turns `00123`/`NA` into `123.0`/null, erases `NULL`, and can hide formula/error cells.
+Workbook ingestion and UI integration are the next release group.
