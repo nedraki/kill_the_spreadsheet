@@ -1,127 +1,98 @@
-import streamlit as st
-import pandas as pd
-import os
+"""Reviewable Excel cleaning: every download is rebuilt from current inputs."""
 import json
-from src_lib.spreadsheet_to_jsonl import dataframe_to_jsonl, bigquery_schema
-from src_lib.clean_da_mess import clean_generic_dataframe
+from pathlib import Path
+
+import streamlit as st
+
+from src_lib.clean_da_mess import clean_generic_dataframe, unique_column_names
+from src_lib.excel_reader import ExcelWorkbook
+from src_lib.spreadsheet_to_jsonl import bigquery_schema, dataframe_to_jsonl, quarantine_to_jsonl
+
+st.set_page_config(page_title='Excel to BigQuery', page_icon='🔄', layout='wide')
+st.title('☠️ Kill the spreadsheet')
+st.write('Clean an Excel table with deterministic rules, review the changes, and export for BigQuery.')
+st.caption('Text is preserved unless a rule can parse it safely. No deduplication, filling missing values, or automatic business corrections.')
 
 
-# --- Page Configuration (Adds a professional touch) ---
-st.set_page_config(
-    page_title="Excel to JSONL Converter",
-    page_icon="🔄",
-    layout="wide",
-)
-
-# --- Session State Management ---
-
-# Initialize session state for converted data and filename
-if "jsonl_data" not in st.session_state:
-    st.session_state.jsonl_data = None
-if "file_name" not in st.session_state:
-    st.session_state.file_name = None
+def preview(frame):
+    """Display duplicate headers and mixed exact values without Arrow coercion."""
+    result = frame.head(20).copy()
+    result.columns = [f'{pos + 1}: {name}' for pos, name in enumerate(result.columns)]
+    return result.map(lambda value: None if value is None else str(value))
 
 
-# Callback function to clear state when a new file is uploaded
-# This ensures old data disappears when the user uploads a new file.
-def clear_existing_data():
-    st.session_state.jsonl_data = None
-    st.session_state.file_name = None
-
-# --- Main App ---
-
-
-st.title("☠️ Kill the spreadsheet")
-st.subheader("Convert Excel to JSONL to facilitate data upload into BigQuery")
-st.divider()
-
-# --- Step 1: Upload ---
-# We use a container to visually group the upload step.
-with st.container(border=True):
-    st.subheader("📄Step 1: Upload Your File")
-    excel_file = st.file_uploader(
-        "Upload an Excel file",
-        type=["xlsx", "xls"],  # Allow both xls and xlsx
-        on_change=clear_existing_data,  # Call the callback on any change
-    )
-
-# --- Step 2 & 3: Process, Preview, and Download (Reactive) ---
-# This entire block only runs if a file has been uploaded.
-if excel_file is not None:
+upload = st.file_uploader('Upload an Excel workbook (.xlsx, up to 10 MiB)', type=['xlsx'])
+st.caption('For legacy .xls files, save as .xlsx first. Formula, error and merged cells need to be resolved before export.')
+if upload is not None:
     try:
-        # Show a spinner while processing
-        with st.spinner(f"Processing {excel_file.name}..."):
-            # 1. Read file for preview
-            df_preview = pd.read_excel(excel_file)
+        workbook = ExcelWorkbook(upload)
+        sheet = st.selectbox('Worksheet', workbook.sheet_names)
+        header_row = int(st.number_input('Header row (Excel row number)', min_value=1, value=1, step=1))
+        raw = workbook.read_sheet(sheet, header_row)
+        st.subheader('1. Review source data')
+        st.dataframe(preview(raw))
+        names = unique_column_names(raw.columns)
+        st.write('Column mapping (source order → export name)')
+        st.dataframe([{'position': pos + 1, 'original': str(original), 'export': name}
+                      for pos, (original, name) in enumerate(zip(raw.columns, names))])
 
-            # 2. Reset file pointer to be read again by your function
-            # (Important! pd.read_excel moves the 'cursor' to the end)
-            excel_file.seek(0)
-
-
-
-            # 4. Store filename
-            base_name = os.path.splitext(excel_file.name)[0]
-            st.session_state.file_name = base_name
-
-        # Show success outside the spinner
-        st.success("✅ File processed successfully!")
-
-        # --- Show Preview ---
-        with st.container(border=True):
-            st.subheader("💡 Step 2: Preview raw data")
-            st.write("Showing the first 5 rows of your file:")
-            st.dataframe(df_preview.head())
-            st.subheader("🚀 Step 3: Clean data & data validations")
-            raw_df = pd.read_excel(excel_file)
-            threshold = st.slider(
-                "Type Inference Threshold",
-                min_value=0.6,
-                max_value=1.0,
-                value=0.9,
-                help=f"A column acquires a datatype if the software can sucessfully parse a ratio of all the values in column. Columns with significant data quality errors will tend to be STRING type if you set a high ratio",
-            )
-            
-            # 3. Run conversion (This happens automatically)
-            (
-                df_comparison,
-                df_load_ready,
-                df_quarantine,
-                type_report,
-            ) = clean_generic_dataframe(raw_df, TYPE_INFERENCE_THRESHOLD=threshold)
-            
-            # JSONL data session state
-            # TO DO: Integrate regex into clean da mess to avoid special characters (using excel to json temporarily)
-            st.session_state.jsonl_data = dataframe_to_jsonl(df_load_ready, type_report)
-
-            st.success("Showing the first 5 rows of cleaned data:")
-            st.write(df_load_ready.head())
-            st.warning("Data quality issues found on these rows:")
-            st.write(df_quarantine.head())
-            st.success("Data types inferred:")
-            st.write(type_report)
-
-        # --- Show Download Button ---
-        # This now appears automatically because st.session_state.jsonl_data is set
-        with st.container(border=True):
-            st.subheader("🚀 Step 3: Download Your File")
-            st.info("Load the JSONL with the matching schema below; disable BigQuery schema autodetection.")
-            st.download_button(
-                label="Download BigQuery schema",
-                data=json.dumps(bigquery_schema(type_report), indent=2),
-                file_name=f"{st.session_state.file_name}.schema.json",
-                mime="application/json",
-            )
-            st.download_button(
-                label=f"Download {st.session_state.file_name}.jsonl",
-                data=st.session_state.jsonl_data,
-                file_name=f"{st.session_state.file_name}.jsonl",
-                mime="application/jsonl",
-                use_container_width=True,  # Makes the button more prominent
-            )
-
-    except Exception as e:
-        st.error(f"An error occurred during processing: {e}")
-        st.warning("Please ensure you uploaded a valid Excel file.")
-        # Clear state on error
-        clear_existing_data()
+        st.subheader('2. Choose cleaning rules')
+        threshold = st.slider('Type inference threshold', min_value=0.6, max_value=1.0, value=1.0,
+                              help='A lower threshold allows a type when some cells fail. Failed rows go only to the rejection file.')
+        number_format = st.selectbox('Number format', ['plain', 'eu', 'us'],
+                                     format_func=lambda option: {'plain': 'Conservative (no grouping or currency conversion)',
+                                                                 'eu': 'European: 1.234,56', 'us': 'US: 1,234.56'}[option])
+        date_choice = st.selectbox('Date format', ['ISO only', 'DD/MM/YYYY', 'MM/DD/YYYY'])
+        date_format = {'ISO only': None, 'DD/MM/YYYY': '%d/%m/%Y', 'MM/DD/YYYY': '%m/%d/%Y'}[date_choice]
+        null_text = st.text_area('Treat these text values as null (one per line)', value='',
+                                 help='Optional and case-insensitive. NA, pending, unknown and other literals are preserved by default.')
+        rules_text = st.text_area('Column types (JSON)', value='{}',
+                                  help='Use export names, for example {"customer_id":"STRING", "amount":"NUMERIC"}. Types: STRING, BOOLEAN, INTEGER, NUMERIC, DATE, DATETIME, TIMESTAMP.')
+        column_types = json.loads(rules_text)
+        if not isinstance(column_types, dict):
+            raise ValueError('Column types must be a JSON object')
+        null_values = null_text.splitlines() if null_text else []
+        comparison, ready, quarantine, report = clean_generic_dataframe(
+            raw, TYPE_INFERENCE_THRESHOLD=threshold, column_types=column_types,
+            number_format=number_format, date_format=date_format, null_values=null_values)
+        # Validate all artifacts before rendering any download button.
+        jsonl = dataframe_to_jsonl(ready, report)
+        schema = bigquery_schema(report)
+        rejected = quarantine_to_jsonl(quarantine)
+        manifest = {
+            'source_file': upload.name, 'sheet': sheet, 'header_row': header_row,
+            'input_rows': len(raw), 'accepted_rows': len(ready), 'rejected_rows': len(quarantine),
+            'accepted_excel_rows': ready.index.tolist(),
+            'column_mapping': ready.attrs['column_mapping'], 'schema': schema,
+            'rules': {'threshold': threshold, 'number_format': number_format,
+                      'date_format': date_format, 'null_values': null_values, 'column_types': column_types},
+        }
+        st.subheader('3. Review the result')
+        st.write(f'{len(raw)} source rows = {len(ready)} accepted + {len(quarantine)} rejected')
+        st.dataframe(preview(ready))
+        st.write('Export schema')
+        st.dataframe(schema)
+        with st.expander('Original and cleaned values side by side'):
+            st.dataframe(preview(comparison))
+        if len(quarantine):
+            st.warning(f'{len(quarantine)} rows were excluded from the main export. Download and resolve the rejected rows.')
+            st.dataframe(preview(quarantine))
+        else:
+            st.success('No rejected rows under the selected rules. Review the schema and preview before loading.')
+        if raw.empty:
+            st.warning('This table has headers but no data rows.')
+        st.subheader('4. Download for BigQuery')
+        st.info('Load the JSONL with its matching schema and disable schema autodetection. This preserves text identifiers and exact numbers.')
+        base = f'{Path(upload.name).stem}_{sheet}'
+        st.download_button('Download accepted JSONL', jsonl, file_name=f'{base}.jsonl',
+                           mime='application/x-ndjson', disabled=ready.empty)
+        st.download_button('Download BigQuery schema', json.dumps(schema, indent=2),
+                           file_name=f'{base}.schema.json', mime='application/json')
+        st.download_button('Download cleaning report', json.dumps(manifest, indent=2, ensure_ascii=False),
+                           file_name=f'{base}.report.json', mime='application/json')
+        if len(quarantine):
+            st.download_button('Download rejected rows', rejected, file_name=f'{base}.rejected.jsonl',
+                               mime='application/x-ndjson')
+    except Exception as exc:
+        st.error(f'Cannot export this workbook: {exc}')
+        st.caption('Correct the source or the selected rules, then try again.')

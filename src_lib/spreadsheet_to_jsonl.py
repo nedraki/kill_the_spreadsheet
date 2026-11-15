@@ -72,7 +72,7 @@ def quarantine_to_jsonl(frame):
     return '\n'.join(records) + ('\n' if records else '')
 
 
-def excel_to_jsonl(input_data, **cleaning_options):
+def excel_to_jsonl(input_data, *, sheet_name=None, header_row=1, **cleaning_options):
     """Convenience conversion; raise on rejected rows rather than hiding data loss.
 
     Use clean_generic_dataframe and dataframe_to_jsonl directly to review and
@@ -81,7 +81,8 @@ def excel_to_jsonl(input_data, **cleaning_options):
     if isinstance(input_data, pd.DataFrame):
         raw = input_data
     elif isinstance(input_data, (str, PathLike)) or hasattr(input_data, 'read'):
-        raw = pd.read_excel(input_data, dtype=object, keep_default_na=False)
+        from src_lib.excel_reader import read_excel
+        raw = read_excel(input_data, sheet_name=sheet_name, header_row=header_row)
     else:
         raise TypeError('Expected a DataFrame, Excel path or binary file-like object')
     _, ready, quarantine, report = clean_generic_dataframe(raw, **cleaning_options)

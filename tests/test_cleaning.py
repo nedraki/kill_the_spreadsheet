@@ -160,3 +160,46 @@ def test_quarantine_partition_with_mixed_index_and_multiple_errors():
     assert ready['a'].tolist() == [3]
     assert quarantine['a'].tolist() == ['2', 'oops']
     assert "Column 'a'" in quarantine.iloc[1][quarantine.attrs['metadata_columns']['quarantine_reason']]
+
+
+def test_locale_never_reinterprets_native_numeric_cells():
+    _, ready, quarantine, report = clean([12.345, '12,345', Decimal('0.000000001'), 123], number_format='eu')
+    assert report['value'] == 'NUMERIC'
+    assert ready['value'].tolist() == [Decimal('12.345'), Decimal('12.345'), Decimal('0.000000001'), Decimal('123')]
+    assert quarantine.empty
+
+
+def test_header_truncation_stays_stable_at_separator_boundary():
+    from src_lib.clean_da_mess import unique_column_names
+    names = unique_column_names(['a' * 298 + '__' + 'b'] * 3)
+    assert unique_column_names(names) == names
+    assert len(set(names)) == 3
+
+
+def test_zero_with_large_exponent_does_not_expand_export():
+    from src_lib.spreadsheet_to_jsonl import dataframe_to_jsonl
+    output = dataframe_to_jsonl(pd.DataFrame({'amount': [Decimal('0E-9999999')]}), {'amount': 'NUMERIC'})
+    assert output == '{"amount":"0"}\n'
+
+
+def test_mixed_currencies_never_lose_denomination():
+    values = ['$10.25', '€20.50', 'C$30.75']
+    _, ready, quarantine, report = clean(values, number_format='us')
+    assert ready['value'].tolist() == values
+    assert report['value'] == 'STRING' and quarantine.empty
+    with pytest.raises(ValueError, match='currenc'):
+        clean(values, number_format='us', column_types={'value': 'NUMERIC'})
+
+
+@pytest.mark.parametrize('values', [['001.0', '002.0'], ['00123', '456']])
+def test_leading_zero_formats_preserve_whole_column(values):
+    _, ready, _, report = clean(values)
+    assert ready['value'].tolist() == values and report['value'] == 'STRING'
+
+
+def test_nonfinite_and_nested_cells_are_recoverable_rejections():
+    values = [float('inf'), Decimal('NaN'), {'a': 1}, 'text', None]
+    _, ready, quarantine, _ = clean(values)
+    assert ready['value'].tolist() == ['text', None]
+    assert len(quarantine) == 3
+    assert quarantine.iloc[2]['value'] == {'a': 1}

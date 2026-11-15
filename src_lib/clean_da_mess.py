@@ -25,16 +25,17 @@ RESERVED = ('_table_', '_file_', '_partition', '_row_timestamp', '__root__',
 
 
 def clean_bigquery_column(col_name):
-    name = str(col_name)
+    name = '' if col_name is None else str(col_name)
     for symbol, code in CURRENCY_MAP.items():
         name = name.replace(symbol, code)
     name = unicodedata.normalize('NFKD', name).encode('ascii', 'ignore').decode()
     name = re.sub(r'[^a-zA-Z0-9_]+', '_', name).strip('_').lower() or 'unnamed_col'
+    name = re.sub(r'_+', '_', name)
     if name[0].isdigit():
         name = '_' + name
     if name.startswith(RESERVED):
         name = 'col' + name
-    return name[:300]
+    return name[:300].rstrip('_')
 
 
 def unique_column_names(columns):
@@ -45,7 +46,7 @@ def unique_column_names(columns):
         name, suffix = base, 2
         while name in used:
             tail = f'_{suffix}'
-            name = base[:300 - len(tail)] + tail
+            name = base[:300 - len(tail)].rstrip('_') + tail
             suffix += 1
         used.add(name)
         result.append(name)
@@ -68,6 +69,9 @@ def _decimal(value, number_format):
     if isinstance(value, bool):
         raise ValueError('Boolean is not a number')
     text = str(value).strip()
+    # Locale separators apply only to textual cells, never native Excel numbers.
+    if isinstance(value, (numbers.Number, Decimal)):
+        number_format = 'plain'
     if number_format != 'plain':
         # Explicit locale opt-in; separators must form valid groups.
         text = re.sub(r'^(?:C\$|A\$|[$€£])\s*', '', text)
@@ -170,7 +174,7 @@ def _infer(values, threshold, number_format, date_format):
         return 'BOOLEAN'
     strings = [v.strip() for v in present if isinstance(v, str)]
     # Preserve IDs and ambiguous numeric notation even below the inference threshold.
-    protected = any(re.fullmatch(r'[+-]?0[0-9]+', s) for s in strings)
+    protected = any(re.fullmatch(r'[+-]?0[0-9]+(?:\.[0-9]+)?', s) for s in strings)
     protected |= bool(strings) and len(strings) == len(present) and set(strings) <= {'0', '1'}
     if number_format == 'plain':
         protected |= any(re.search(r'[0-9][,\s][0-9]|[$€£]', s) for s in strings)
@@ -226,7 +230,12 @@ def clean_generic_dataframe(df_raw, TYPE_INFERENCE_THRESHOLD=0.90, *,
     for position, name in enumerate(names):
         values = [None if isinstance(v, str) and v.strip().casefold() in nulls else v
                   for v in df_raw.iloc[:, position].tolist()]
-        kind = overrides.get(name) or _infer(values, TYPE_INFERENCE_THRESHOLD, number_format, date_format)
+        currencies = {match.group(1) for value in values if isinstance(value, str)
+                      if (match := re.match(r'\s*(C\$|A\$|[$€£])', value))}
+        if len(currencies) > 1 and overrides.get(name) in {'INTEGER', 'NUMERIC'}:
+            raise ValueError(f"Column '{name}' contains mixed currencies; split by currency before numeric conversion")
+        kind = overrides.get(name) or ('STRING' if len(currencies) > 1 else
+                                      _infer(values, TYPE_INFERENCE_THRESHOLD, number_format, date_format))
         report[name] = kind
         converted = []
         for row, value in enumerate(values):
